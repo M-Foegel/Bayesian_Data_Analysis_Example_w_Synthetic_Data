@@ -1,0 +1,13 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+brm_model_full.rds
+brm_model_full_check.rds
+brm_model_full_double_iter.rds
+brm_model_full_higher_mean.rds
+brm_model_full_larger_var.rds
+brm_model_full_lower_mean.rds
+brm_model_full_priors_only.rds
+brm_model_full_smaller_var.rds
+brm_model_full_wo_priors.rds

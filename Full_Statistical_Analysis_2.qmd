@@ -1,0 +1,1107 @@
+---
+title: "Bayesian Data Analysis 2"
+author: "Martial Foegel"
+format:
+  html:
+    toc: true
+    toc-depth: 4
+    toc-expand: true
+    toc-location: left
+    page-layout: full
+    df-print: paged
+    embed-resources: true
+date: 11/25/2024 
+institute: Laboratoire de Linguistique Formelle 
+bibliography: references.bib
+link-citations: true 
+---
+
+<!-- apres html mettre embed-resources: true -->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# ipak function: install and load multiple R packages.
+# check to see if packages are installed. Install them if they are not, 
+# then load them into the R session if load_pkg is set to true.
+
+ipak <- function(pkg, load_pkg = T){
+  new.pkg <- pkg[!(pkg %in% installed.packages()[, "Package"])]
+  if (length(new.pkg)){
+    install.packages(new.pkg, dependencies = TRUE)}
+  if (load_pkg){
+    sapply(pkg, require, character.only = TRUE)}
+}
+
+# usage
+packages_to_load <- c("data.table", "dplyr", "brms", "ggplot2", "patchwork")
+
+packages_not_to_load <- c("readxl", "mclogit", "job", "stringr",
+                          "nnet", "stevemisc", "coda", "bayestestR",
+                          "performance", "insight", "ggokabeito",
+                          "tidybayes", "ggthemes")
+
+ipak(packages_to_load)
+
+ipak(packages_not_to_load, load_pkg = F)
+```
+
+The following analysis will be based on a real dataset that came from a recent experiment. Since this work is still pending publication, I will show all the steps but using a synthetic dataset made with the same structure as the real one, but not the same results.
+
+## The dataset
+
+This dataset is based on an experience which follows the Elicited Production Task paradigm. In this experiment, participants of 4 different age group (3, 4, 5 years old and adults) are shown a picture before hearing a sentence that wrongly characterise said picture (for example a picture with a boy and a girl, the boy having a ball in it's hand, while hearing the sentence "the girl has the ball"). The element that doesn't match between the picture and the sentence can be the object of the sentence, the indirect object, the adjunct or the subject. The participants have to comment on what doesn't match by producing an answer which will be later categorized into different types of answer (like Sentence or Cleft).
+
+```{r, eval=TRUE}
+dt <- readRDS("synthetic_dt.rds")
+```
+
+What the data looks like now :
+
+```{r}
+head(dt)
+```
+
+## Statistiques descriptives
+
+```{r}
+summary(dt)
+```
+
+### Find the data structure
+
+In our dataset, we have two sampling units or random variables : **Item** and **Participant**. We also have two independent or predictor variables, **Age_group** and **Condition** (i.e. direct object, indirect object, subject and adjunct), and one independent variable, also called a variable of interest or response variable, **Answer_type** (constituent, sentence, identification sentence, cleft, cleft attempt, reduced cleft and other).
+
+```{r}
+table(dt$Item, dt$Age_group)[1:5,]
+
+table(dt$Item, dt$Condition)[1:5,]
+```
+
+Each item is seen by each age group, but each of those items is only presented in one condition.
+
+```{r}
+table(dt$Participant, dt$Age_group)[c(1:2, 20:22),]
+
+table(dt$Participant, dt$Condition)[1:5,]
+```
+
+Each participant only belongs to one age group, but they do see all conditions (10 for condition Adjunct, Direct_object and Subject, 4 for Indirect_object)
+
+This does imply a hierarchical data structure, to take into account during the analysis.
+
+We end up with the following maximal model:
+
+```{r}
+model_formula <- Answer_type ~ Age_group * Condition +
+  (1+Age_group|Item)+ (1+Condition|Participant)
+```
+
+### A note on the distribution of the response variable
+
+`Answer_type` is a categorical variable that follows a categorical distribution.
+
+```{r}
+head(dt)
+```
+
+If we had something like below we would be in a multinomial distribution:
+
+```{r}
+head(table(dt$Participant, dt$Answer_type))
+```
+
+Those are linked distributions, the same way the Bernoulli and binomial distributions are linked, but the distinction is important to note in order to specify the right family in our Bayesian package *brms* later on.
+
+## Inferential statistics
+
+### Why did we go for a bayesian analysis ?
+
+Analysis where the response variable is categorical are less developed than numerical or even binary ones (especially in their practical implementation like in R). And they are especially sparse when we have to take into account the hierarchical structure of our data.
+
+We can do it relatively well when we don't take into account the hierarchical structure (example below).
+
+```{r}
+summary(nnet::multinom(Answer_type ~ Age_group + Condition, data = dt))$coefficients[1:3, 1:3]
+```
+
+But this becomes complicated when we add the random structure. I only found one package that was able to do random structure, but it doesn't run with a complex structure like ours.
+
+```{r, eval=FALSE}
+mb_logit <- mclogit::mblogit(Answer_type ~ Age_group + Condition, 
+                data = dt,
+                random=list(~1+Age_group|Item,
+                            ~1+Condition|Participant)) 
+```
+
+This is most likely due to a combination of frequentist models not being able to support complex data structure for a categorical variable as well as the quasi-complete separation of our data (see @faqwhat; @mansournia2018). The second part happens when one of the categories of the answer variable has low frequencies overall or in some combination of the predictor variable (we have no answer of a specific type with some specific parameters cases which causes the quasi-complete separation). If I understood @albert1984 correctly, complete separation would lead to a flat likelihood, whereas a quasi-complete likelihood would lead to an almost flat likelihood on some range of the effect.
+
+```{r, eval=TRUE}
+table(dt$Answer_type, dt$Age_group, dt$Condition)[1:4,1:4,3]
+```
+
+In any case, switching to Bayesian analysis will allow us to take into account the structure of the data, as well as mitigate any separation problem by using priors on the effects of each log of odds ratio.
+
+### Bayesian Analysis
+
+Using the package **brms** [@brms].
+
+```{r}
+#detect the number of cores
+parallel::detectCores()
+
+nb_cores <- 4
+```
+
+If you have less than 4 cores, change the values of *nb_cores*.
+
+Setting up reference levels:
+
+```{r}
+dt$Answer_type <- relevel(dt$Answer_type, ref = "Cleft") #the expected response
+dt$Age_group <- relevel(dt$Age_group, ref = "Adults") #adultes
+dt$Condition <- relevel(dt$Condition, ref = "Subject") #la condition Sujet
+```
+
+Following our investigation on the data structure, our model will have the following formula:
+
+```{r}
+model_formula <- Answer_type ~ Age_group * Condition +
+  (1+Age_group|Item)+ (1+Condition|Participant)
+```
+
+#### Model with default prior
+
+```{r, eval=FALSE}
+#don't run this unless necessary (takes time)
+
+#this takes a while to run (in hours)
+#use the job package to make it run in the background
+job::job({
+  brm(
+    model_formula, 
+    data = dt,
+    family = categorical(),
+    cores = 4,
+    file = "brm_model_full_wo_priors")
+})
+```
+
+```{r}
+brm_model_full_wo_priors <- readRDS("brm_model_full_wo_priors.rds")
+```
+
+The distribution of the response/dependant variable is categorical. In **brms**, this corresponds to a categorical family which is only available with a multivariate logit link @notation. $$f(y) = \mu_y = \frac{exp(\eta_y)}{\sum_1^K exp(\eta_y)}$$
+
+```{r}
+summary(brm_model_full_wo_priors)$fixed[1:10,]
+```
+
+```{r, eval=TRUE}
+#way too many plot
+plot(brm_model_full_wo_priors, variable = "b_muCleftAttempt_Intercept")
+```
+
+We end up with convergence problems, and Rhat \> 1.05, which most likely come from the quasi-complete separation of our data that flat priors can't handle ("flat" pour la classe "b"). Adding priors will make our results more reliable as well as drastically reduce computing time.
+
+```{r, eval=FALSE}
+get_prior(brm_model_full_wo_priors)[1:10,]
+```
+
+#### Testing with the full model and specified priors
+
+Setting the priors for coefficients to $Normal(0,10)$ on the log-odds scale means we center the parameters around the fact that the parameter as no effect, but with a good amount of uncertainty (still not as much as a flat prior).
+
+##### Why this prior ?
+
+The statistical intuition:
+
+Change between something that has a 99% chance of happening or a 99.9% chance of happening are not that big on the log-odds scale. Here x2 is the reference level.
+
+```{r}
+n_x1 <- 1
+N <- 10
+
+p1 <- n_x1/N
+
+(odds_p1 <- p1/(1-p1)) #odds of x1
+
+n_x2 <- 9
+p2 <- n_x2/N
+
+(odds_p2 <- p2/(1-p2)) #odds of x2
+
+log(odds_p1/odds_p2) #log odds ratio
+```
+
+```{r}
+n_x1 <- 1
+N <- 100
+
+p1 <- n_x1/N
+
+(odds_p1 <- p1/(1-p1)) #odds of x1
+
+n_x2 <- 99
+p2 <- n_x2/N
+
+(odds_p2 <- p2/(1-p2)) #odds of x2
+
+log(odds_p1/odds_p2) #log odds ratio
+```
+
+```{r}
+n_x1 <- 1
+N <- 1000
+
+p1 <- n_x1/N
+
+(odds_p1 <- p1/(1-p1)) #odds of x1
+
+n_x2 <- 999
+p2 <- n_x2/N
+
+(odds_p2 <- p2/(1-p2)) #odds of x2
+
+log(odds_p1/odds_p2) #log odds ratio
+```
+
+In our case, $N \approx 200$. So we need a prior that simulate enough values from the range of -15 to 15 to be safe, but there is less need for anything beyond this range.
+
+```{r}
+rm(n_x1, n_x2, p1, p2, odds_p1, odds_p2, N)
+```
+
+##### A Cauchy prior
+
+I found out one recommendation for logistic regression (that should apply for categorical data), was to use the Cauchy distribution with a mean of 0 and scale 2.5 with scaled numerical dependant variable (of which we don't have any) @gelman2008. As you can see below, it's not that far of the normal distribution we are going to use, it just has more weight around 0 while still leaving room for more extreme values.
+
+```{r}
+plot(density(rnorm(n = 100000, mean = 0, sd = 10)), main = "b", ylim = c(0, 0.15))
+lines(density(rcauchy(n = 100000, location = 0, scale = 2.5),
+             from = -40, to = 40), col = "blue") #add a legend
+legend(x = "topright",
+       legend = c("Normal", "Cauchy"),
+                  col = c("black", "blue"),
+       lty = 1)
+```
+
+Unfortunately the Cauchy prior is not implemented in the *brms* package, but hopefully the rest of the WAMBS check-list will convince you that the normal prior used is good enough.
+
+##### Running the full model
+
+Let's add the normal prior to our model. Right now the default priors look like this:
+
+```{r}
+priors <- get_prior(model_formula, 
+                    data = dt,
+                    family = categorical())
+
+priors[1:25,]
+```
+
+Adding the normal prior:
+
+```{r}
+#will be put on all "b" type priors, population level effects (and all corresponding dpar, distributionnal parameters), 
+#and also all coef, coefficient within the parameter class (i.e. the independant/predictor variables)
+#this last part isn't shown in the "priors" table but is applied in the model (see below)
+priors$prior[priors$class =="b" & priors$coef == ""] <- "normal(0,10)"
+
+priors[1:25,]
+```
+
+Let's do a quick check on the prior. This model is really easy to run as it only checks the prior distribution (no likelihood or posterior computed here) !
+
+```{r, eval=FALSE}
+#doesn't take long
+job::job({
+  brm(model_formula, 
+      data = dt,
+      family = categorical(),
+      prior = priors,
+      cores = 4,
+      sample_prior = 'only',
+      file = "brm_model_full_priors_only")
+  
+})
+```
+
+```{r}
+brm_model_full_priors_only <- readRDS(file = "brm_model_full_priors_only.rds")
+```
+
+The following line allows you to easily check what priors you have effectively attributed to the model without going through stancode (`make_stancode()`). Unfortunately, we cannot do that with the model without priors here, as the model is complaining about no prior defined (which I think has something to do with the default flat priors that would show an infinite range of possible values). Here we want $y_{rep}$ to show a large variation around $y$.
+
+```{r}
+#Compare the empirical distribution of the data y to the distributions of simulated/replicated data yrep from the posterior predictive distribution.
+#default to density overlay
+pp_check(brm_model_full_priors_only, ndraws=100)
+```
+
+Do a quick check to see if the model works with default settings and specified priors.
+
+```{r, eval=FALSE}
+#don't run this unless necessary (takes time)
+
+#this takes a while to run (45min)
+#use the job package to make it run in the background
+job::job({
+  brm(
+    model_formula,
+    data = dt,
+    family = categorical(),
+    prior = priors,
+    cores = 4,
+    file = "brm_model_full_check")
+  
+})
+
+```
+
+Posterior predictive check. Here we want $y_{rep}$ to have a small variation around $y$ :
+
+```{r}
+brm_model_full_check <- readRDS("brm_model_full_check.rds")
+
+pp_check(brm_model_full_check, ndraws=100)
+```
+
+This model seems to work, so let's run it a little longer to makes sure the chains are mixing well.
+
+```{r, eval=FALSE}
+#don't run this unless necessary (takes time)
+
+#this takes a while to run (20 mins ?)
+#use the job package to make it run in the background
+job::job({
+  brm(
+    model_formula,
+    data = dt,
+    family = categorical(),
+    prior = priors,
+    iter = 4000,
+    warmup = 1000,
+    cores = 4,
+    control = list(adapt_delta = 0.95),
+    seed = 24102024,
+    file = "brm_model_full"
+)})
+```
+
+```{r}
+brm_model_full <- readRDS("brm_model_full.rds")
+```
+
+```{r, eval=FALSE}
+#if you want to see the actual Stan code
+stancode(brm_model_full)
+```
+
+Posterior predictive check:
+
+```{r}
+pp_check(brm_model_full,  ndraws=100)
+```
+
+### Results of Bayesian analysis
+
+```{r}
+#too big alone
+sum_brm_model_full <- summary(brm_model_full)
+posterior_summary <- sum_brm_model_full$fixed
+```
+
+The results below are on the log-odds scale:
+
+```{r}
+posterior_summary[1:10,] # out of 96
+```
+
+The fact that the category **Cleft** is not present in the summary above is due to the way a categorical family model is parametrized in *brms*, with the first factor of **Answer_Type** fixed to 0 (see @notation). It is in fact our reference, just like we can see among our dependant variable that there is no **Adults** for **Group_Age** and no **Subject** for **Condition**, which are also reference levels.
+
+We are going to focus on whether the Credible Interval contains 0 or not (made using the Equivalent tailed interval). We will also put the Probability of Direction (PD), as well as its equivalent p-value.
+
+"Thus, a two-sided p-value of respectively .1, .05, .01 and .001 would correspond approximately to a pd of 95%, 97.5%, 99.5% and 99.95%" from the reporting guidelines @makowski2019. We will use these interpretation helper here.
+
+We won't be using the ROPE here. Using the ROPE for something other that numerical variable would require setting up a correct ROPE CI (what's more, collinearity invalidates ROPE as the probabilities are conditional on independence and cannot be used for hypothesis testing based on univariate marginals).
+
+```{r}
+get_result_table <- function(brm_model){
+  sum_brm_model_full <- summary(brm_model)
+  posterior_summary <- sum_brm_model_full$fixed
+  
+  tmp_result_table <- posterior_summary[,c("Estimate", "l-95% CI", "u-95% CI")]
+
+  tmp_result_table <- tmp_result_table %>% 
+    mutate(`Position CI compared to 0` = case_when(
+      `l-95% CI` < 0 & `u-95% CI` > 0 ~ "contains 0", 
+      `l-95% CI` > 0 ~ "above 0",
+      `u-95% CI` < 0 ~ "below 0"))
+  
+  tmp_result_table[,c("Estimate",
+                      "l-95% CI",
+                      "u-95% CI")] <- round(tmp_result_table[,c("Estimate",
+                                                                "l-95% CI",
+                                                                "u-95% CI")], 2)
+  tmp_result_table$PD <- bayestestR::p_direction(brm_model, as_p = FALSE)$pd
+  tmp_result_table$`Eq. p-value` <- bayestestR::pd_to_p(tmp_result_table$PD)
+  tmp_result_table$PD <- paste0(round(tmp_result_table$PD*100,2), "%")
+  tmp_result_table$`Eq. p-value` <-insight::format_p(tmp_result_table$`Eq. p-value`)
+  
+  return(tmp_result_table)
+}
+
+results_brm_model_full <- get_result_table(brm_model_full)
+```
+
+```{r}
+results_brm_model_full[1:10,]
+```
+
+Example interpretation of result of the interaction muSentence_Age_group4y.o.:ConditionAdjunct ! Being in the condition Adjunct rather than Subject in 4 years old doesn't increase the odds of responding by a Sentence rather than by a Cleft as much as with Adults.
+
+```{r, eval=FALSE}
+write.csv(results_brm_model_full, file = "results.csv")
+```
+
+#### Answering specific questions
+
+Example question:
+
+Does Cleft production in the subject condition significantly increase across age group ?
+
+Small precision : "across the entire population of participants" is implied here, suggesting that we are looking for a marginal effect (prediction is averaged over the random effects) rather than a conditional effect (which would vary by participant and item).
+
+```{r}
+# Create dataframe needed to calculate the expected posterior predictive distribution
+newdata <- expand.grid(
+  Age_group = c("3 y/o", "4 y/o", "5 y/o", "Adults"), #the 4 age groups
+  Condition = "Subject", # only for the condition SUBJECT
+  Item = NA,            # Les effets aléatoires peuvent être moyennés
+  Participant = NA
+)
+```
+
+Expectation of the posterior predictive distribution, aka the conditional expectation, $E(y_{new}|x_{new}, y_{obs})$ to the data.
+
+```{r}
+#epred_draws is basically a neater version of the brms package posterior_epred
+mean_Cleft_d_ages <- brm_model_full %>% 
+  tidybayes::epred_draws(newdata = newdata,
+                         re_formula = NA)%>% # put re_formula = NULL for conditional mean
+  filter(.category == "Cleft")
+
+compare_mean_Cleft_d_ages <- mean_Cleft_d_ages %>%
+  tidybayes::compare_levels(variable = .epred,
+                            by = Age_group,
+                            comparison = "ordered")
+
+compare_mean_Cleft_d_ages %>% 
+  ggdist::median_qi()
+```
+
+Plotting
+
+```{r, fig.width = 12, fig.align = "center"}
+p1 <- mean_Cleft_d_ages %>%
+  ggplot(aes(x = .epred, y = Age_group, fill = Age_group)) +
+  ggdist::stat_dotsinterval(quantiles = 100) + 
+  ggokabeito::scale_fill_okabe_ito() +
+  labs(x = "Expected proportion of Cleft response \n in Subject Condition", y = NULL,
+       fill = "Opposition parties allowed",
+       subtitle = "Posterior predictions") +
+  ggthemes::theme_clean() +
+  theme(legend.position = "bottom")
+
+
+p2 <- compare_mean_Cleft_d_ages %>%
+  ggplot(aes(x = .epred, y = Age_group, fill = Age_group)) +
+  ggdist::stat_halfeye() +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(x = "Average marginal effect of Age_group", y = NULL,
+       subtitle = "Marginal effect") +
+  ggthemes::theme_clean() +
+  theme(legend.position = "bottom")
+
+# Combined plot
+(p1 | p2) +
+  plot_annotation(title = "Global grand mean of the Cleft response \n in the subject Condition depending on the age group",
+                  subtitle = "re_formula = NA; no item or participant in newdata",
+                  theme = ggthemes::theme_clean())
+```
+
+```{r, eval=FALSE}
+save.image(file = "analysis.RData")
+```
+
+#### A few graphics to better understand the data overall
+
+Marginal with regards to the the Age group and the Condition respectively
+
+```{r}
+conditional_effects(brm_model_full, categorical = T, ask = FALSE)
+```
+
+Fully conditional graph:
+
+```{r}
+conditions <- make_conditions(brm_model_full, "Age_group")
+
+c_eff <- conditional_effects(brm_model_full, "Condition", conditions = conditions,
+                    categorical = T,
+                    ncol = 2) #you can make a plot with just conditional_effect
+
+
+c_eff <- as.data.frame(c_eff$`Condition:cats__`)
+
+c_eff$Answer_type <- c_eff$cats__
+```
+
+A slightly better plot:
+
+```{r}
+#creating plot
+ggplot(c_eff,aes(x=Condition,y=estimate__, group=Answer_type, 
+                 fill = Answer_type, color = Answer_type))+
+  geom_point()+
+  geom_linerange(aes(ymin=lower__, ymax=upper__))+
+  facet_wrap(vars(Age_group), nrow = 2)+
+  #geom_line(size=1, position=position_dodge(0.05), aes(color=cats__, linetype=cats__))+
+  labs(y="Probability",x="Condition")
+```
+
+### WAMBS v2
+
+To verify that the analysis was performed correctly, we can do the check-up presented by @vandeschoot2021 which has a version in R @wambsch.
+
+#### 1. Do you understand the priors?
+
+```{r}
+#function to only show unique unique_prior_per_class
+# otherwise the table from get priors has 171 lines...
+show_unique_prior_per_class <- function(brm_model){
+  prior_used <- get_prior(brm_model)
+  unique_prior_used <- prior_used[!duplicated(as.data.frame(prior_used[,c("prior", "class")])),]
+  return(unique_prior_used)
+}
+
+show_unique_prior_per_class(brm_model_full)
+```
+
+```{r}
+par(mfrow = c(2,2))
+# the rnorm function uses the standard devation instead of variance, that is why we use the sqrt
+plot(density(rnorm(n = 100000, mean = 0, sd = 10)), main = "b") 
+
+for_shift_scale_T_dist <- stevemisc::rst(n = 100000, df = 3, mu = 0, sigma = 2.5)
+for_shift_scale_T_dist_pos <- for_shift_scale_T_dist[for_shift_scale_T_dist>0]
+
+
+plot(density(for_shift_scale_T_dist), main = "Intercept", xlim = c(-50, 50))
+plot(density(for_shift_scale_T_dist_pos), main = "sd", xlim = c(0, 100))
+
+#lacks the correlation but i don't have a good way of representing it
+```
+
+#### 2. Does the trace-plot exhibit convergence?
+
+There are too much parameters to converge to check them out visually. We can check them using convergence diagnostics.
+
+The Gelman-Rubin Diagnostic shows the PSRF values (using the within and between chain variability). You should look at the Upper CI/Upper limit, which are all should be close to 1. If they aren’t close to 1, you should use more iterations. Note: The Gelman and Rubin diagnostic is also automatically given in the summary of *brms* under the column Rhat.
+
+```{r}
+all_Rhat <- c(sum_brm_model_full$fixed$Rhat,
+               sum_brm_model_full$random$Item$Rhat,
+               sum_brm_model_full$random$Participant$Rhat)
+plot(density(all_Rhat))
+```
+
+There is question regarding the Rhat as a measure of convergeance [@vehtari2021 and it's supplement @rank-nor].
+
+Another way to test for convergence is the Monte Carlo standard error :
+
+"One way to compute Monte Carlo standard errors is with the method of *batch means*. The idea here is we divide our long MCMC sampler chain into equal size segments and compute our summary statistic on each segment. If the segments are of the proper size, we can think of them as “independent replicates”, even though individual samples of the MCMC sampler will not be independent of each other in general. From these replicates, we compute an estimate of variability from the given chain. \[...\] It's worth nothing that the Monte Carlo standard error is a quantity with units attached to it. Therefore, determining when the standard error is "small enough" will require a certain understanding of the context in which the problem is being addressed." [@peng]
+
+Implementation from the package BayestestR comes from @kruschke2014
+
+```{r}
+bayestestR::mcse(brm_model_full)[1:10,]
+```
+
+Graphically:
+
+```{r}
+modelposterior <- as.mcmc(brm_model_full)
+#coda::gelman.diag(modelposterior) equivalant to RHat
+
+#only the first 96 are "b" parameters the rest are for the random part of the model
+coda::gelman.plot(modelposterior[,1:9]) 
+```
+
+The Geweke Diagnostic shows the z-scores for a test of equality of means between the first and last parts of each chain, which should be \<1.96. A separate statistic is calculated for each variable in each chain. In this way it check whether a chain has stabilized. If this is not the case, you should increase the number of iterations. In the plots you should check how often values exceed the boundary lines of the z-scores. Scores above 1.96 or below -1.96 mean that the two portions of the chain significantly differ and full chain convergence was not obtained.
+
+```{r}
+tmp <- unlist(coda::geweke.diag(modelposterior))
+
+plot(density(tmp))
+```
+
+```{r}
+#coda::geweke.diag(modelposterior) ##too much
+coda::geweke.plot(modelposterior[, 1:4])
+```
+
+```{r}
+bayestestR::diagnostic_posterior(brm_model_full)[1:10,]
+```
+
+If you need to diagnostic all the draws...
+
+```{r, eval=FALSE}
+bayestestR::diagnostic_draws(brm_model_full)
+```
+
+#### 3. Does convergence remain after doubling the number of iterations?
+
+As is recommended in the WAMBS checklist, we double the amount of iterations to check for local convergence.
+
+```{r, eval=FALSE}
+#don't run this unless necessary (takes time)
+
+#this takes a while to run (20 mins ?)
+#use the job package to make it run in the background
+job::job({
+  brm(
+    model_formula,
+    data = dt,
+    family = categorical(),
+    prior = priors,
+    iter = 8000,
+    warmup = 1000,
+    cores = 4,
+    control = list(adapt_delta = 0.95),
+    file = "brm_model_full_double_iter"
+)})
+```
+
+"You should again have a look at the above-mentioned convergence statistics, but we can also compute the relative bias to inspect if doubling the number of iterations influences the posterior parameter estimates. In order to preserve clarity we just calculate the bias of the two regression coefficients.
+
+You should combine the relative bias in combination with substantive knowledge about the metric of the parameter of interest to determine when levels of relative deviation are negligible or problematic. For example, with a regression coefficient of 0.001, a 5% relative deviation level might not be substantively relevant. However, with an intercept parameter of 50, a 10% relative deviation level might be quite meaningful. The specific level of relative deviation should be interpreted in the substantive context of the model. Some examples of interpretations are:
+
+```         
+if relative deviation is < |5|%, then do not worry;
+if relative deviation > |5|%, then rerun with 4x nr of iterations."
+```
+
+@wambsch
+
+I don't like to do the relative bias on the estimates because some of our estimates are really close to 0. And when the estimates is close to 0, the bias will be huge but this won't have any impact on our interpretation of the results. In fact, all relative bias measures will show huge differences when the estimates are close to 0... .
+
+Example below for the percent error measure presented by Rens van de Schoot:
+
+```{r}
+100*((4 - 4.1)/4)
+
+100*((1 - 1.1)/1)
+
+100*((0.1 - 0.2)/0.1)
+```
+
+We could look at the relative difference of the PD, since it is bounded between 50 and 100.
+
+```{r}
+100*((50 - 51)/50)
+
+100*((98 - 99)/98)
+
+100*((98 - 50)/98)
+```
+
+```{r}
+brm_model_full_double_iter <- readRDS("brm_model_full_double_iter.rds")
+
+results_brm_model_full_double_iter <- get_result_table(brm_model_full_double_iter)
+```
+
+```{r}
+#function to get the numerical PD from our result table
+get_num_PD <- function(percent_PD){
+  num_pd <- as.numeric(stringr::str_extract(percent_PD, "\\d+\\.*\\d*"))
+  return(num_pd)
+}
+
+#function to calculate the relative bias
+get_relative_bias_PD <- function(result_model_1, result_model_2){
+  PD1 <- get_num_PD(result_model_1$PD)
+  PD2 <- get_num_PD(result_model_2$PD)
+  rel_bias_PD <- 100*((PD1-PD2)/PD1)
+  return(rel_bias_PD)
+}
+
+sort(get_relative_bias_PD(results_brm_model_full,
+                          results_brm_model_full_double_iter))
+```
+
+Between -3 and 1.7, so we are clear on that !
+
+Alternatively, we could also just look at differences between both models estimates and their CrI.
+
+```{r}
+results_brm_model_full[1:10,1:3] - results_brm_model_full_double_iter[1:10,1:3]
+```
+
+Looking at the actual estimates:
+
+```{r}
+cbind.data.frame(results_brm_model_full, results_brm_model_full_double_iter)[1:10,]
+```
+
+We will go for the relative bias on the PD for the rest of this document, since we have a lot of parameters.
+
+#### 4. Does the posterior distribution histogram have enough information?
+
+Only showing one here, but you should of course check everyone of the parameters.
+
+```{r}
+#too much histograms if no selections
+# only show population-level effects in the plots
+mcmc_plot(brm_model_full, type = "hist", variable = "b_muCleftAttempt_Intercept", regex = TRUE)
+```
+
+#### 5. Do the chains exhibit a strong degree of autocorrelation?
+
+```{r}
+mcmc_plot(brm_model_full, type = "acf", variable = "b_muCleftAttempt_Intercept", regex = TRUE)
+```
+
+These results show that autocorrelation is quite strong after a few lags. This means it is important to make sure we ran the analysis with a lot of samples (which we did), because with a high autocorrelation it will take longer until the whole parameter space has been identified. For more information on autocorrelation check this paper. [@link2012]
+
+#### 6. Do the posterior distributions make substantive sense?
+
+```{r}
+mcmc_plot(brm_model_full, type = "dens", variable = "b_muCleftAttempt_Intercept", regex = TRUE)
+```
+
+#### 7. Do different specification of the variance priors influence the results?
+
+```{r, eval=FALSE}
+priors_larger_var <- priors 
+
+priors_larger_var$prior[priors_larger_var$class =="b" &
+                          priors_larger_var$coef == ""] <- "normal(0,20)"
+
+job::job({
+  brm(
+    model_formula,
+    data = dt,
+    family = categorical(),
+    prior = priors_larger_var,
+    iter = 4000,
+    warmup = 1000,
+    cores = 4,
+    control = list(adapt_delta = 0.95),
+    file = "brm_model_full_larger_var"
+)})
+```
+
+```{r}
+brm_model_full_larger_var <- readRDS("brm_model_full_larger_var.rds")
+
+results_brm_model_full_larger_var <- get_result_table(brm_model_full_larger_var)
+```
+
+```{r}
+sort(get_relative_bias_PD(results_brm_model_full,
+                     results_brm_model_full_larger_var))
+```
+
+We have a few higher values here, we can check if thsi relative difference would have an impact on the interpretation of the data when $> |5|%$
+
+```{r}
+compare_results <- cbind.data.frame(results_brm_model_full[c(1:3,5)], 
+                                    results_brm_model_full_larger_var[c(1:3,5)],
+                                    rel_bias_PD = get_relative_bias_PD(results_brm_model_full,
+                                                    results_brm_model_full_larger_var))
+
+compare_results[abs(compare_results$rel_bias_PD)>5,]
+```
+
+In all the above cases, the estimates did change a bit but the CrI stayed mostly the same. And it also seems like it wouldn't change much in the way of interpretation anyway.One thing that does change is that it takes significantly longer to run !
+
+```{r, eval=FALSE}
+priors_smaller_var <- priors
+
+priors_smaller_var$prior[priors_smaller_var$class =="b" &
+                          priors_smaller_var$coef == ""] <- "normal(0,2)"
+
+
+job::job({
+  brm(
+    model_formula,
+    data = dt,
+    family = categorical(),
+    prior = priors_smaller_var,
+    iter = 4000,
+    warmup = 1000,
+    cores = 4,
+    control = list(adapt_delta = 0.95),
+    file = "brm_model_full_smaller_var"
+)})
+```
+
+```{r}
+brm_model_full_smaller_var <- readRDS(file = "brm_model_full_smaller_var.rds")
+
+results_brm_model_full_smaller_var <- get_result_table(brm_model_full_smaller_var)
+```
+
+```{r}
+sort(get_relative_bias_PD(results_brm_model_full,
+                     results_brm_model_full_smaller_var))
+```
+
+That's a lot. It may indicate that less variance in our prior is bad here.
+
+```{r}
+compare_results <- cbind.data.frame(results_brm_model_full[c(1:3,5)],
+                                    results_brm_model_full_smaller_var[c(1:3,5)],
+                                    rel_bias_PD = get_relative_bias_PD(results_brm_model_full,
+                                                    results_brm_model_full_smaller_var))
+
+head(compare_results[abs(compare_results$rel_bias_PD)>5,])
+```
+
+Yes it would change our interpretation in quite a few cases. We can show graphically why a smaller variance might be bad !
+
+##### Showing the difference in priors
+
+```{r}
+m1prior <- rnorm(12000, mean = 0, sd = 10)
+m1post <- as_draws_df(brm_model_full)
+m2prior <- rnorm(12000, mean = 0, sd = 20)
+m2post <- as_draws_df(brm_model_full_larger_var)
+m3prior <- rnorm(12000, mean = 0, sd = 2)
+m3post <- as_draws_df(brm_model_full_smaller_var)
+
+
+
+#showing density plots for a1
+
+#make a data frame and get it in shape for ggplot
+a1df <- data.frame(m1_prior = m1prior,
+                   m1_post = m1post$b_muCleftAttempt_Intercept,
+                   m2_prior = m2prior,
+                   m2_post =  m2post$b_muCleftAttempt_Intercept,
+                   m3_prior = m3prior,
+                   m3_post =  m3post$b_muCleftAttempt_Intercept) %>%
+        tidyr::pivot_longer(cols = everything(), names_to = c("model","type"), names_pattern = "(.*)_(.*)", values_to = "value")
+# make plot
+p1 <- a1df %>%
+  ggplot() +
+  geom_density(aes(x = value, color = model, linetype = type), linewidth = 1) +
+  theme_minimal()+
+  ggtitle("Different priors for parameter muCleftAttempt_Intercept")+
+  xlim(-40,40)
+
+p1
+```
+
+For a simple parameter, all the posterior go in the same direction.
+
+```{r}
+#make a data frame and get it in shape for ggplot
+a2df <- data.frame(m1_prior = m1prior,
+                   m1_post = m1post$`b_muConstituant_Age_group5yDo:ConditionIndirect_object`,
+                   m2_prior = m2prior,
+                   m2_post =  m2post$`b_muConstituant_Age_group5yDo:ConditionIndirect_object`,
+                   m3_prior = m3prior,
+                   m3_post =  m3post$`b_muConstituant_Age_group5yDo:ConditionIndirect_object`) %>%
+        tidyr::pivot_longer(cols = everything(), names_to = c("model","type"), names_pattern = "(.*)_(.*)", values_to = "value")
+# make plot
+p2 <- a2df %>%
+  ggplot() +
+  geom_density(aes(x = value, color = model, linetype = type), linewidth = 1) +
+  theme_minimal()+
+  ggtitle("Different priors for parameter muConstituant_Age_group5y.o.:ConditionIndirect_object")+
+  xlim(-10,10)
+
+p2
+```
+
+In the original data, for a more complicated parameter, the highly informative prior (m3) ends up with a posterior going in the opposite direction as the models with the two other priors.
+
+#### 8. Is there a notable effect of the prior when compared with non-informative priors ?
+
+```{r}
+brm_model_full_wo_priors <- readRDS("brm_model_full_wo_priors.rds")
+
+results_brm_model_full_wo_priors <- get_result_table(brm_model_full_wo_priors)
+
+sort(get_relative_bias_PD(results_brm_model_full,
+                     results_brm_model_full_wo_priors))
+```
+
+Yes there is, but in this case we know why we are not using non-informative priors.
+
+#### 9. Are the results stable from a sensitivity analysis ?
+
+You should be able to do this by setting up an hyperprior, but since I had a hard time setting the prior the traditional *brms* way, I'll settle on two simple Bayesian model with a change of means.
+
+```{r, eval=FALSE}
+#don't run this unless necessary (takes time)
+priors_lower_mean <- priors
+
+
+priors_lower_mean$prior[priors_lower_mean$class =="b" & 
+                        priors_lower_mean$coef == ""] <- "normal(-10,10)"
+
+
+#this takes a while to run (20 mins ?)
+#use the job package to make it run in the background
+job::job({
+  brm(
+    model_formula,
+    data = dt,
+    family = categorical(),
+    prior = priors_lower_mean,
+    iter = 4000,
+    warmup = 1000,
+    cores = 4,
+    control = list(adapt_delta = 0.95), 
+    file = "brm_model_full_lower_mean"
+)})
+```
+
+```{r}
+brm_model_full_lower_mean <- readRDS("brm_model_full_lower_mean.rds")
+
+results_brm_model_full_lower_mean <- get_result_table(brm_model_full_lower_mean)
+
+sort(get_relative_bias_PD(results_brm_model_full,
+                     results_brm_model_full_lower_mean))
+```
+
+```{r}
+compare_results <- cbind.data.frame(results_brm_model_full[c(1:3,5)],
+                                    results_brm_model_full_lower_mean[c(1:3,5)],
+                                    rel_bias_PD = get_relative_bias_PD(results_brm_model_full,
+                                                    results_brm_model_full_lower_mean))
+
+head(compare_results[abs(compare_results$rel_bias_PD)>5,])
+```
+
+Does show some variation, but the bigger picture (CrI) stays mostly the same.
+
+```{r, eval=FALSE}
+#don't run this unless necessary (takes time)
+priors_higher_mean <- priors
+
+
+priors_higher_mean$prior[priors_higher_mean$class =="b" & 
+                        priors_higher_mean$coef == ""] <- "normal(10,10)"
+
+
+#this takes a while to run (20 mins ?)
+#use the job package to make it run in the background
+job::job({
+  brm(
+    model_formula,
+    data = dt,
+    family = categorical(),
+    prior = priors_higher_mean,
+    iter = 4000,
+    warmup = 1000,
+    cores = 4,
+    control = list(adapt_delta = 0.95), 
+    file = "brm_model_full_higher_mean"
+)})
+```
+
+```{r}
+brm_model_full_higher_mean <- readRDS("brm_model_full_higher_mean.rds")
+
+results_brm_model_full_higher_mean <- get_result_table(brm_model_full_higher_mean)
+
+sort(get_relative_bias_PD(results_brm_model_full,
+                     results_brm_model_full_higher_mean))
+```
+
+```{r}
+compare_results <- cbind.data.frame(results_brm_model_full[c(1:3,5)],
+                                    results_brm_model_full_higher_mean[c(1:3,5)],
+                                    rel_bias_PD = get_relative_bias_PD(results_brm_model_full,
+                                                    results_brm_model_full_higher_mean))
+
+head(compare_results[abs(compare_results$rel_bias_PD)>5,])
+```
+
+Basically pushes the results a bit more towards the left or right, so slightly different CrI that are close to 0 are affected.
+
+#### 10. Is the Bayesian way of interpreting and reporting model results used?
+
+To report things from a Bayesian analysis, you can check the BARG guidelines @kruschke2021
+
+Or check an article that I think made a good job of showing Bayesian results @levshina2022
+
+### Other ways to plot results
+
+Of different priors
+
+```{r}
+combined <- rbind(bayesplot::mcmc_intervals_data(m1post),
+                  bayesplot::mcmc_intervals_data(m2post),
+                  bayesplot::mcmc_intervals_data(m3post))
+
+combined$model <- rep(c("sd 10", "sd 20", "sd 2"), each = ncol(m1post)-3)
+```
+
+```{r}
+combined |> 
+  filter(parameter %in% c("b_muCleftAttempt_Intercept",
+                          "b_muConstituant_Age_group5y.o.:ConditionIndirect_object")) |>
+  ggplot(aes(x = m, y = parameter, color = model)) + 
+  geom_linerange(aes(xmin = l, xmax = h), position = position_dodge2(width = 0.5, reverse = T), linewidth=2)+
+  geom_linerange(aes(xmin = ll, xmax = hh), position =  position_dodge2(width = 0.5, reverse = T))+
+  geom_point(aes(fill = model), position = position_dodge2(width = 0.5, reverse = T), color="black")+
+  geom_vline(xintercept=0,linetype="dashed")
+```
+
+Of multiple parameters estimates
+
+```{r}
+posterior_draws <- brms::as_draws_matrix(brm_model_full)[,c("b_muCleftAttempt_Intercept",
+                                                            "b_muConstituant_Age_group5yDo:ConditionIndirect_object")]
+bayesplot::mcmc_areas(posterior_draws)
+```
+
+```{r}
+brm_model_full |> 
+  tidybayes::tidy_draws() |> 
+  select(starts_with("b_muCleftAttempt_Con")) |> 
+  # rename(reaction = b_conditionreaction,
+  #        discrimination = b_conditiondiscrimination) |> 
+  tidyr::pivot_longer(cols = everything()) |> 
+  ggplot(aes(x = value, y = name)) +
+  tidybayes::stat_halfeye(#fill = project_colors[1]
+                          ) +
+  ylab("") +
+  geom_vline(aes(xintercept = 0), #color = project_colors[2],
+             size = 2)
+```
+
+If you want the distributions of the individual items.
+
+```{r, eval =TRUE}
+ranef(brm_model_full)$Item[,,"muCleftAttempt_Intercept"] |> 
+  as.data.frame() |> 
+  tibble::rownames_to_column("Item") |> 
+  ggplot(aes(y = Item, x = Estimate)) +
+  geom_errorbar(aes(xmin = `Q2.5`, xmax = `Q97.5`), 
+                #color = project_colors[6],
+                alpha = 0.7)+
+  geom_vline(aes(xintercept = 0),# color = project_colors[1], 
+             size = 2, alpha = 0.8) +
+  geom_point(#color = project_colors[2],
+             size = 2)
+```
